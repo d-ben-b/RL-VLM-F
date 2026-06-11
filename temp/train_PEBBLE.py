@@ -84,7 +84,9 @@ class Workspace(object):
         self.replay_buffer = ReplayBuffer(
             self.env.observation_space.shape,
             self.env.action_space.shape,
-            (10000),  # we cannot afford to store too many images in the replay buffer.
+            (
+                int(cfg.replay_buffer_capacity) if not self.cfg.image_reward else 10000
+            ),  # we cannot afford to store too many images in the replay buffer.
             self.device,
             store_image=self.cfg.image_reward,
             image_size=image_height,
@@ -273,22 +275,26 @@ class Workspace(object):
         self.logger.dump(self.step)
 
     def learn_reward(self, first_flag=0):
-        progress_ratio = self.total_feedback / self.cfg.max_feedback
-
+        # get feedbacks
         labeled_queries = 0
-        if first_flag == 1 or progress_ratio < 0.25:
-            # 訓練前期（前 25% 的扣打）：模型還沒學會基本概念，Uncertainty 都是雜訊。
-            # 強制使用 K-Center 採樣，確保 VLM 看過各種不同狀態的圖片。
-            print(
-                f"[Adaptive Sampling] Progress {progress_ratio:.2f} < 0.25: Using K-Center Sampling"
-            )
-            labeled_queries = self.reward_model.kcenter_sampling()
+        if first_flag == 1:
+            # if it is first time to get feedback, need to use random sampling
+            labeled_queries = self.reward_model.uniform_sampling()
         else:
-            # 訓練中後期：模型已經有基本判斷力，開始針對「意見分歧」的邊界樣本進行採樣
-            print(
-                f"[Adaptive Sampling] Progress {progress_ratio:.2f} >= 0.25: Using Hybrid Disagreement Sampling"
-            )
-            labeled_queries = self.reward_model.kcenter_disagree_sampling()
+            if self.cfg.feed_type == 0:
+                labeled_queries = self.reward_model.uniform_sampling()
+            elif self.cfg.feed_type == 1:
+                labeled_queries = self.reward_model.disagreement_sampling()
+            elif self.cfg.feed_type == 2:
+                labeled_queries = self.reward_model.entropy_sampling()
+            elif self.cfg.feed_type == 3:
+                labeled_queries = self.reward_model.kcenter_sampling()
+            elif self.cfg.feed_type == 4:
+                labeled_queries = self.reward_model.kcenter_disagree_sampling()
+            elif self.cfg.feed_type == 5:
+                labeled_queries = self.reward_model.kcenter_entropy_sampling()
+            else:
+                raise NotImplementedError
 
         self.total_feedback += self.reward_model.mb_size
         self.labeled_feedback += labeled_queries

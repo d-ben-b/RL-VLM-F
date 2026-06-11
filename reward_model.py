@@ -375,20 +375,24 @@ class RewardModel:
         with torch.no_grad():
             r_hat1 = self.r_hat_member(x_1, member=member)
             r_hat2 = self.r_hat_member(x_2, member=member)
-            r_hat1 = r_hat1.sum(axis=1)
-            r_hat2 = r_hat2.sum(axis=1)
+            if not self.image_reward:
+                # image rewards already produce one scalar per query; only
+                # segment-based state-action rewards need summing over the segment.
+                r_hat1 = r_hat1.sum(axis=1)
+                r_hat2 = r_hat2.sum(axis=1)
             r_hat = torch.cat([r_hat1, r_hat2], axis=-1)
-        
+
         # taking 0 index for probability x_1 > x_2
         return F.softmax(r_hat, dim=-1)[:,0]
-    
+
     def p_hat_entropy(self, x_1, x_2, member=-1):
         # softmaxing to get the probabilities according to eqn 1
         with torch.no_grad():
             r_hat1 = self.r_hat_member(x_1, member=member)
             r_hat2 = self.r_hat_member(x_2, member=member)
-            r_hat1 = r_hat1.sum(axis=1)
-            r_hat2 = r_hat2.sum(axis=1)
+            if not self.image_reward:
+                r_hat1 = r_hat1.sum(axis=1)
+                r_hat2 = r_hat2.sum(axis=1)
             r_hat = torch.cat([r_hat1, r_hat2], axis=-1)
         
         ent = F.softmax(r_hat, dim=-1) * F.log_softmax(r_hat, dim=-1)
@@ -466,14 +470,15 @@ class RewardModel:
     
     def get_queries(self, mb_size=20):
         len_traj, max_len = len(self.inputs[0]), len(self.inputs)
-        
+
         if len(self.inputs[-1]) < len_traj:
             max_len = max_len - 1
-        
+
         # get train traj
         train_inputs = np.array(self.inputs[:max_len])
         train_targets = np.array(self.targets[:max_len])
-        if self.vlm_label or self.image_reward:
+        need_images = self.vlm_label or self.image_reward
+        if need_images:
             train_images = np.array(self.img_inputs[:max_len])
             if 'Cloth' in self.env_name:
                 train_images = train_images.squeeze(1)
@@ -481,24 +486,17 @@ class RewardModel:
         batch_index_2 = np.random.choice(max_len, size=mb_size, replace=True)
         sa_t_2 = train_inputs[batch_index_2] # Batch x T x dim of s&a
         r_t_2 = train_targets[batch_index_2] # Batch x T x 1
-        if self.vlm_label or self.image_reward:
-            img_t_2 = train_images[batch_index_2] # Batch x T x *img_dim
-        
+
         batch_index_1 = np.random.choice(max_len, size=mb_size, replace=True)
         sa_t_1 = train_inputs[batch_index_1] # Batch x T x dim of s&a
         r_t_1 = train_targets[batch_index_1] # Batch x T x 1
-        if self.vlm_label or self.image_reward:
-            img_t_1 = train_images[batch_index_1] # Batch x T x *img_dim
-                
+
         sa_t_1 = sa_t_1.reshape(-1, sa_t_1.shape[-1]) # (Batch x T) x dim of s&a
         r_t_1 = r_t_1.reshape(-1, r_t_1.shape[-1]) # (Batch x T) x 1
         sa_t_2 = sa_t_2.reshape(-1, sa_t_2.shape[-1]) # (Batch x T) x dim of s&a
         r_t_2 = r_t_2.reshape(-1, r_t_2.shape[-1]) # (Batch x T) x 1
-        if self.vlm_label or self.image_reward:
-            img_t_1 = img_t_1.reshape(-1, img_t_1.shape[2], img_t_1.shape[3], img_t_1.shape[4])
-            img_t_2 = img_t_2.reshape(-1, img_t_2.shape[2], img_t_2.shape[3], img_t_2.shape[4])
 
-        # Generate time index 
+        # Generate time index
         time_index = np.array([list(range(i*len_traj, i*len_traj+self.size_segment)) for i in range(mb_size)])
         if 'Cloth' not in self.env_name:
             random_idx_2 = np.random.choice(len_traj-self.size_segment, size=mb_size, replace=True).reshape(-1,1)
@@ -506,42 +504,42 @@ class RewardModel:
             random_idx_1 = np.random.choice(len_traj-self.size_segment, size=mb_size, replace=True).reshape(-1,1)
             time_index_1 = time_index + random_idx_1
         else:
+            random_idx_1 = np.zeros((mb_size, 1), dtype=int)
+            random_idx_2 = np.zeros((mb_size, 1), dtype=int)
             time_index_2 = time_index
             time_index_1 = time_index
-        if self.vlm_label or self.image_reward:
-            if self.vlm_label == 1 or self.image_reward: # use a single image for querying vlm for the labeling
-                image_time_index = np.array([[i*len_traj+self.size_segment - 1] for i in range(mb_size)])
-            else:
-                interval = self.size_segment // self.vlm_label
-                image_time_index = np.array([[i * len_traj + self.size_segment - 1 - j * interval for j in range(self.vlm_label - 1, -1, -1)] for i in range(mb_size)])
-                image_time_index = np.maximum(image_time_index, 0)
-
-            if 'Cloth' not in self.env_name:
-                image_time_index_2 = image_time_index + random_idx_2
-                image_time_index_1 = image_time_index + random_idx_1
-            else:
-                image_time_index_2 = image_time_index
-                image_time_index_1 = image_time_index
 
         sa_t_1 = np.take(sa_t_1, time_index_1, axis=0) # Batch x size_seg x dim of s&a
         r_t_1 = np.take(r_t_1, time_index_1, axis=0) # Batch x size_seg x 1
         sa_t_2 = np.take(sa_t_2, time_index_2, axis=0) # Batch x size_seg x dim of s&a
         r_t_2 = np.take(r_t_2, time_index_2, axis=0) # Batch x size_seg x 1
-        if self.vlm_label or self.image_reward:
-            img_t_1 = np.take(img_t_1, image_time_index_1, axis=0) # Batch x vlm_label x *img_dim
-            img_t_2 = np.take(img_t_2, image_time_index_2, axis=0) # Batch x vlm_label x *img_dim
-            
-            batch_size, horizon, image_height, image_width, _ = img_t_1.shape
 
-            transposed_images = np.transpose(img_t_1, (0, 2, 1, 3, 4))
-            img_t_1 = transposed_images.reshape(batch_size, image_height, horizon * image_width, 3) # batch x image_height x (time_horizon * image_width) x 3
-            transposed_images = np.transpose(img_t_2, (0, 2, 1, 3, 4))
-            img_t_2 = transposed_images.reshape(batch_size, image_height, horizon * image_width, 3) # batch x image_height x (time_horizon * image_width) x 3
-        
-        if not self.vlm_label and not self.image_reward:
+        if not need_images:
             return sa_t_1, sa_t_2, r_t_1, r_t_2
+
+        # Gather only the image frames we actually need. Materializing every frame
+        # for every candidate (mb x T x H x W x 3) OOMs for large mb_size, and all
+        # but a few frames per segment are immediately discarded.
+        if self.vlm_label == 1 or self.image_reward: # single image per segment for the vlm query
+            frame_offsets = np.array([[self.size_segment - 1]]) # (1, 1)
         else:
-            return sa_t_1, sa_t_2, r_t_1, r_t_2, img_t_1, img_t_2
+            interval = self.size_segment // self.vlm_label
+            frame_offsets = np.array([[self.size_segment - 1 - j * interval
+                                       for j in range(self.vlm_label - 1, -1, -1)]]) # (1, vlm_label)
+
+        # within-trajectory frame indices, shape (mb_size, n_frames)
+        frames_1 = np.clip(frame_offsets + random_idx_1, 0, len_traj - 1)
+        frames_2 = np.clip(frame_offsets + random_idx_2, 0, len_traj - 1)
+        img_t_1 = train_images[batch_index_1[:, None], frames_1] # Batch x n_frames x *img_dim
+        img_t_2 = train_images[batch_index_2[:, None], frames_2] # Batch x n_frames x *img_dim
+
+        batch_size, horizon, image_height, image_width, _ = img_t_1.shape
+        img_t_1 = np.transpose(img_t_1, (0, 2, 1, 3, 4)).reshape(
+            batch_size, image_height, horizon * image_width, 3) # batch x H x (n_frames * W) x 3
+        img_t_2 = np.transpose(img_t_2, (0, 2, 1, 3, 4)).reshape(
+            batch_size, image_height, horizon * image_width, 3)
+
+        return sa_t_1, sa_t_2, r_t_1, r_t_2, img_t_1, img_t_2
 
     def put_queries(self, sa_t_1, sa_t_2, labels):
         total_sample = sa_t_1.shape[0]
@@ -757,127 +755,137 @@ class RewardModel:
         else:
             return sa_t_1, sa_t_2, r_t_1, r_t_2, img_t_1, img_t_2, labels
     
+    def _unpack_queries(self, queries):
+        # get_queries returns 6 values (with images) when vlm_label/image_reward
+        # is on, otherwise 4. Normalise to always expose img_t_1/img_t_2.
+        if self.vlm_label or self.image_reward:
+            sa_t_1, sa_t_2, r_t_1, r_t_2, img_t_1, img_t_2 = queries
+        else:
+            sa_t_1, sa_t_2, r_t_1, r_t_2 = queries
+            img_t_1 = img_t_2 = None
+        return sa_t_1, sa_t_2, r_t_1, r_t_2, img_t_1, img_t_2
+
+    def _format_images_for_reward(self, img):
+        # img: (N, H, W, 3) uint8 -> (N, 3, H', W') float32 in [0, 1], matching
+        # the layout the reward CNN is trained and evaluated on.
+        img = img[:, ::self.resize_factor, ::self.resize_factor, :]
+        return np.transpose(img, (0, 3, 1, 2)).astype(np.float32) / 255.0
+
+    def _reward_inputs(self, sa_t_1, sa_t_2, img_t_1, img_t_2):
+        # the reward ensemble consumes images when image_reward is on, otherwise
+        # state-action segments.
+        if self.image_reward:
+            return self._format_images_for_reward(img_t_1), self._format_images_for_reward(img_t_2)
+        return sa_t_1, sa_t_2
+
+    def _kcenter_select(self, sa_t_1, sa_t_2, num_candidates):
+        temp_sa = np.concatenate([sa_t_1[:, :, :self.ds].reshape(num_candidates, -1),
+                                  sa_t_2[:, :, :self.ds].reshape(num_candidates, -1)], axis=1)
+
+        max_len = self.capacity if self.buffer_full else self.buffer_index
+        if (not self.image_reward) and max_len > 0:
+            # the buffer holds state-action segments we can use as the reference set
+            tot_sa_1 = self.buffer_seg1[:max_len, :, :self.ds]
+            tot_sa_2 = self.buffer_seg2[:max_len, :, :self.ds]
+            tot_sa = np.concatenate([tot_sa_1.reshape(max_len, -1),
+                                     tot_sa_2.reshape(max_len, -1)], axis=1)
+        else:
+            # the buffer is empty, or (for image rewards) holds images that can't
+            # serve as a state-action reference: seed the greedy selection with the
+            # first candidate so we pick a diverse subset among the candidates.
+            tot_sa = temp_sa[:1]
+        return KCenterGreedy(temp_sa, tot_sa, self.mb_size)
+
+    def _select(self, index, sa_t_1, sa_t_2, r_t_1, r_t_2, img_t_1, img_t_2):
+        sa_t_1, sa_t_2 = sa_t_1[index], sa_t_2[index]
+        r_t_1, r_t_2 = r_t_1[index], r_t_2[index]
+        if img_t_1 is not None:
+            img_t_1, img_t_2 = img_t_1[index], img_t_2[index]
+        return sa_t_1, sa_t_2, r_t_1, r_t_2, img_t_1, img_t_2
+
+    def _label_and_store(self, sa_t_1, sa_t_2, r_t_1, r_t_2, img_t_1, img_t_2):
+        # get labels (vlm or scripted) and push the accepted queries to the buffer,
+        # mirroring uniform_sampling's handling of the vlm / image_reward variants.
+        if self.vlm_label:
+            if not self.image_reward:
+                sa_t_1, sa_t_2, r_t_1, r_t_2, _, vlm_labels = self.get_label(
+                    sa_t_1, sa_t_2, r_t_1, r_t_2, img_t_1, img_t_2)
+            else:
+                sa_t_1, sa_t_2, r_t_1, r_t_2, img_t_1, img_t_2, _, vlm_labels = self.get_label(
+                    sa_t_1, sa_t_2, r_t_1, r_t_2, img_t_1, img_t_2)
+            labels = vlm_labels
+        else:
+            if not self.image_reward:
+                sa_t_1, sa_t_2, r_t_1, r_t_2, labels = self.get_label(
+                    sa_t_1, sa_t_2, r_t_1, r_t_2)
+            else:
+                sa_t_1, sa_t_2, r_t_1, r_t_2, img_t_1, img_t_2, labels = self.get_label(
+                    sa_t_1, sa_t_2, r_t_1, r_t_2, img_t_1, img_t_2)
+
+        if len(labels) > 0:
+            if not self.image_reward:
+                self.put_queries(sa_t_1, sa_t_2, labels)
+            else:
+                self.put_queries(img_t_1[:, ::self.resize_factor, ::self.resize_factor, :],
+                                 img_t_2[:, ::self.resize_factor, ::self.resize_factor, :],
+                                 labels)
+        return len(labels)
+
     def kcenter_sampling(self):
-        
-        # get queries
+        # get queries (keeps images so the vlm can still label the selected pairs)
         num_init = self.mb_size*self.large_batch
-        sa_t_1, sa_t_2, r_t_1, r_t_2 =  self.get_queries(
-            mb_size=num_init)
-        
-        # get final queries based on kmeans clustering
-        temp_sa_t_1 = sa_t_1[:,:,:self.ds]
-        temp_sa_t_2 = sa_t_2[:,:,:self.ds]
-        temp_sa = np.concatenate([temp_sa_t_1.reshape(num_init, -1),  
-                                  temp_sa_t_2.reshape(num_init, -1)], axis=1)
-        
-        max_len = self.capacity if self.buffer_full else self.buffer_index
-        
-        tot_sa_1 = self.buffer_seg1[:max_len, :, :self.ds]
-        tot_sa_2 = self.buffer_seg2[:max_len, :, :self.ds]
-        tot_sa = np.concatenate([tot_sa_1.reshape(max_len, -1),  
-                                 tot_sa_2.reshape(max_len, -1)], axis=1)
-        
-        selected_index = KCenterGreedy(temp_sa, tot_sa, self.mb_size)
+        sa_t_1, sa_t_2, r_t_1, r_t_2, img_t_1, img_t_2 = self._unpack_queries(
+            self.get_queries(mb_size=num_init))
 
-        r_t_1, sa_t_1 = r_t_1[selected_index], sa_t_1[selected_index]
-        r_t_2, sa_t_2 = r_t_2[selected_index], sa_t_2[selected_index]
-        
-        # get labels
-        sa_t_1, sa_t_2, r_t_1, r_t_2, labels = self.get_label(
-            sa_t_1, sa_t_2, r_t_1, r_t_2)
-        
-        if len(labels) > 0:
-            self.put_queries(sa_t_1, sa_t_2, labels)
-        
-        return len(labels)
-    
+        # select a diverse subset via k-center on the state-action representation
+        selected_index = self._kcenter_select(sa_t_1, sa_t_2, num_init)
+        sa_t_1, sa_t_2, r_t_1, r_t_2, img_t_1, img_t_2 = self._select(
+            selected_index, sa_t_1, sa_t_2, r_t_1, r_t_2, img_t_1, img_t_2)
+
+        return self._label_and_store(sa_t_1, sa_t_2, r_t_1, r_t_2, img_t_1, img_t_2)
+
     def kcenter_disagree_sampling(self):
-        
         num_init = self.mb_size*self.large_batch
         num_init_half = int(num_init*0.5)
-        
-        # get queries
-        sa_t_1, sa_t_2, r_t_1, r_t_2 =  self.get_queries(
-            mb_size=num_init)
-        
-        # get final queries based on uncertainty
-        _, disagree = self.get_rank_probability(sa_t_1, sa_t_2)
+
+        sa_t_1, sa_t_2, r_t_1, r_t_2, img_t_1, img_t_2 = self._unpack_queries(
+            self.get_queries(mb_size=num_init))
+
+        # narrow down to the most uncertain (disagreed-upon) candidates
+        pred_1, pred_2 = self._reward_inputs(sa_t_1, sa_t_2, img_t_1, img_t_2)
+        _, disagree = self.get_rank_probability(pred_1, pred_2)
         top_k_index = (-disagree).argsort()[:num_init_half]
-        r_t_1, sa_t_1 = r_t_1[top_k_index], sa_t_1[top_k_index]
-        r_t_2, sa_t_2 = r_t_2[top_k_index], sa_t_2[top_k_index]
-        
-        # get final queries based on kmeans clustering
-        temp_sa_t_1 = sa_t_1[:,:,:self.ds]
-        temp_sa_t_2 = sa_t_2[:,:,:self.ds]
-        
-        temp_sa = np.concatenate([temp_sa_t_1.reshape(num_init_half, -1),  
-                                  temp_sa_t_2.reshape(num_init_half, -1)], axis=1)
-        
-        max_len = self.capacity if self.buffer_full else self.buffer_index
-        
-        tot_sa_1 = self.buffer_seg1[:max_len, :, :self.ds]
-        tot_sa_2 = self.buffer_seg2[:max_len, :, :self.ds]
-        tot_sa = np.concatenate([tot_sa_1.reshape(max_len, -1),  
-                                 tot_sa_2.reshape(max_len, -1)], axis=1)
-        
-        selected_index = KCenterGreedy(temp_sa, tot_sa, self.mb_size)
-        
-        r_t_1, sa_t_1 = r_t_1[selected_index], sa_t_1[selected_index]
-        r_t_2, sa_t_2 = r_t_2[selected_index], sa_t_2[selected_index]
+        sa_t_1, sa_t_2, r_t_1, r_t_2, img_t_1, img_t_2 = self._select(
+            top_k_index, sa_t_1, sa_t_2, r_t_1, r_t_2, img_t_1, img_t_2)
 
-        # get labels
-        sa_t_1, sa_t_2, r_t_1, r_t_2, labels = self.get_label(
-            sa_t_1, sa_t_2, r_t_1, r_t_2)
-        
-        if len(labels) > 0:
-            self.put_queries(sa_t_1, sa_t_2, labels)
-        
-        return len(labels)
-    
+        # then pick a diverse subset of those via k-center
+        selected_index = self._kcenter_select(sa_t_1, sa_t_2, num_init_half)
+        sa_t_1, sa_t_2, r_t_1, r_t_2, img_t_1, img_t_2 = self._select(
+            selected_index, sa_t_1, sa_t_2, r_t_1, r_t_2, img_t_1, img_t_2)
+
+        return self._label_and_store(sa_t_1, sa_t_2, r_t_1, r_t_2, img_t_1, img_t_2)
+
     def kcenter_entropy_sampling(self):
-        
         num_init = self.mb_size*self.large_batch
         num_init_half = int(num_init*0.5)
-        
-        # get queries
-        sa_t_1, sa_t_2, r_t_1, r_t_2 =  self.get_queries(
-            mb_size=num_init)
-        
-        
-        # get final queries based on uncertainty
-        entropy, _ = self.get_entropy(sa_t_1, sa_t_2)
-        top_k_index = (-entropy).argsort()[:num_init_half]
-        r_t_1, sa_t_1 = r_t_1[top_k_index], sa_t_1[top_k_index]
-        r_t_2, sa_t_2 = r_t_2[top_k_index], sa_t_2[top_k_index]
-        
-        # get final queries based on kmeans clustering
-        temp_sa_t_1 = sa_t_1[:,:,:self.ds]
-        temp_sa_t_2 = sa_t_2[:,:,:self.ds]
-        
-        temp_sa = np.concatenate([temp_sa_t_1.reshape(num_init_half, -1),  
-                                  temp_sa_t_2.reshape(num_init_half, -1)], axis=1)
-        
-        max_len = self.capacity if self.buffer_full else self.buffer_index
-        
-        tot_sa_1 = self.buffer_seg1[:max_len, :, :self.ds]
-        tot_sa_2 = self.buffer_seg2[:max_len, :, :self.ds]
-        tot_sa = np.concatenate([tot_sa_1.reshape(max_len, -1),  
-                                 tot_sa_2.reshape(max_len, -1)], axis=1)
-        
-        selected_index = KCenterGreedy(temp_sa, tot_sa, self.mb_size)
-        
-        r_t_1, sa_t_1 = r_t_1[selected_index], sa_t_1[selected_index]
-        r_t_2, sa_t_2 = r_t_2[selected_index], sa_t_2[selected_index]
 
-        # get labels
-        sa_t_1, sa_t_2, r_t_1, r_t_2, labels = self.get_label(
-            sa_t_1, sa_t_2, r_t_1, r_t_2)
-        
-        if len(labels) > 0:
-            self.put_queries(sa_t_1, sa_t_2, labels)
-        
-        return len(labels)
-    
+        sa_t_1, sa_t_2, r_t_1, r_t_2, img_t_1, img_t_2 = self._unpack_queries(
+            self.get_queries(mb_size=num_init))
+
+        # narrow down to the highest-entropy candidates
+        pred_1, pred_2 = self._reward_inputs(sa_t_1, sa_t_2, img_t_1, img_t_2)
+        entropy, _ = self.get_entropy(pred_1, pred_2)
+        top_k_index = (-entropy).argsort()[:num_init_half]
+        sa_t_1, sa_t_2, r_t_1, r_t_2, img_t_1, img_t_2 = self._select(
+            top_k_index, sa_t_1, sa_t_2, r_t_1, r_t_2, img_t_1, img_t_2)
+
+        # then pick a diverse subset of those via k-center
+        selected_index = self._kcenter_select(sa_t_1, sa_t_2, num_init_half)
+        sa_t_1, sa_t_2, r_t_1, r_t_2, img_t_1, img_t_2 = self._select(
+            selected_index, sa_t_1, sa_t_2, r_t_1, r_t_2, img_t_1, img_t_2)
+
+        return self._label_and_store(sa_t_1, sa_t_2, r_t_1, r_t_2, img_t_1, img_t_2)
+
     def uniform_sampling(self):
         if not self.vlm_label: 
             # get queries

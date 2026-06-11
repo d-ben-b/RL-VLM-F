@@ -25,9 +25,10 @@ from reward_model import gen_image_net, gen_image_net2
 device = 'cuda'
 
 
+# 在 reward_model_score.py 頂部加入：
+from transformers import AutoImageProcessor, DeiTModel
 
 def construct_ensemble(self):
-    from transformers import AutoImageProcessor, DeiTModel
     # 載入凍結的 DeiT 模型作為特徵提取器
     self.feature_extractor = DeiTModel.from_pretrained("facebook/deit-base-distilled-patch16-224").to(device)
     self.image_processor = AutoImageProcessor.from_pretrained("facebook/deit-base-distilled-patch16-224")
@@ -39,9 +40,7 @@ def construct_ensemble(self):
     for i in range(self.de):
         if not self.image_reward:
             # (保留原本的狀態輸入網路)
-            model = nn.Sequential(*gen_net(in_size=self.ds+self.da,
-                                            out_size=1, H=self.reward_model_H, n_layers=self.reward_model_layers,
-                                            activation=self.activation)).float().to(device)
+            model = nn.Sequential(*gen_net(in_size=self.ds+self.da, ...)).float().to(device)
         else:
             # DeiT-base 的輸出維度通常是 768
             model = nn.Sequential(
@@ -981,41 +980,14 @@ class RewardModelScore:
                     sa_t_1 = sa_t_1.squeeze(1)
                     sa_t_2 = sa_t_2.squeeze(1)
                 
-                # ==== 1. 取得當前 member 的預測 (需計算梯度) ====
+                # get logits
                 r_hat = self.r_hat_member(sa_t_1, member=member) # predict the score
                 if not self.image_reward:
                     r_hat = r_hat[:, -1, :].view(-1, 1) # NOTE: we only queried the vlm the last frame
 
-                # ==== 2. 取得 Ensemble 針對此 Batch 的共識 (不計算梯度) ====
-                with torch.no_grad():
-                    ensemble_preds = []
-                    for m in range(self.de):
-                        pred = self.r_hat_member(sa_t_1, member=m)
-                        if not self.image_reward:
-                            pred = pred[:, -1, :].view(-1, 1)
-                        ensemble_preds.append(pred)
-                    
-                    # 將所有 member 的預測拼接起來 (Batch_size, ensemble_size)
-                    ensemble_preds = torch.cat(ensemble_preds, dim=1) 
-                    ensemble_mean = ensemble_preds.mean(dim=1, keepdim=True)
-                    ensemble_std = ensemble_preds.std(dim=1, keepdim=True)
-
-                # ==== 3. 識別 VLM 幻覺/雜訊標籤 ====
-                # 誤差極大 (預測平均與標籤差超過 0.8) 且 模型間共識極高 (標準差小於 0.2)
-                error = torch.abs(ensemble_mean - labels.view(-1, 1))
-                is_confident = ensemble_std < 0.2 
-                is_noisy = (error > 0.8) & is_confident
-
-                # ==== 4. 計算加權損失 (Self-Correction) ====
-                # 正常的樣本權重為 1.0，雜訊樣本的權重降為 0.1 (避免模型被錯標籤帶壞)
-                sample_weights = torch.ones_like(labels.view(-1, 1)).float()
-                sample_weights[is_noisy] = 0.1
-
-                # 使用 reduction='none' 取得每一個 sample 獨立的 MSE loss
-                unweighted_loss = F.mse_loss(r_hat, labels.view(-1, 1), reduction='none')
-                
-                # 將 loss 乘上權重後再取平均
-                curr_loss = (unweighted_loss * sample_weights).mean()
+                # compute loss
+                # curr_loss = self.CEloss(r_hat, labels)
+                curr_loss = self.MSEloss(r_hat, labels.view(-1, 1))
                 loss += curr_loss
                 ensemble_losses[member].append(curr_loss.item())
                 
